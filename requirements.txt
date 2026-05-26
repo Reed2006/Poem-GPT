@@ -1,0 +1,7 @@
+# 数据准备（Python 3.8+）
+torch>=1.12.0
+datasets>=2.0.0
+huggingface_hub>=0.16.0
+
+# 训练与作图（train.py）
+matplotlib>=3.5.0
