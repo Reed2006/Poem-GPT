@@ -11,6 +11,43 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from prosody import NUM_RHYMES, NUM_TONES
+
+
+class LoRALinear(nn.Module):
+    def __init__(
+        self,
+        base_linear: nn.Linear,
+        rank: int,
+        alpha: float,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        if rank <= 0:
+            raise ValueError("LoRA rank 必须 > 0")
+        self.base = base_linear
+        self.rank = int(rank)
+        self.alpha = float(alpha)
+        self.scaling = self.alpha / self.rank
+        self.dropout = nn.Dropout(float(dropout))
+        device = base_linear.weight.device
+        dtype = base_linear.weight.dtype
+        for param in self.base.parameters():
+            param.requires_grad = False
+        self.lora_A = nn.Parameter(
+            torch.empty(self.rank, base_linear.in_features, device=device, dtype=dtype)
+        )
+        self.lora_B = nn.Parameter(
+            torch.zeros(base_linear.out_features, self.rank, device=device, dtype=dtype)
+        )
+        nn.init.kaiming_uniform_(self.lora_A, a=5 ** 0.5)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        base_out = self.base(x)
+        lora_hidden = F.linear(self.dropout(x), self.lora_A)
+        lora_out = F.linear(lora_hidden, self.lora_B) * self.scaling
+        return base_out + lora_out
+
 
 class CausalSelfAttention(nn.Module):
     def __init__(
@@ -116,22 +153,71 @@ class CharGPT(nn.Module):
         n_layer: int = 4,
         d_ff: int = 1024,
         dropout: float = 0.1,
+        use_prosody: bool = False,
+        num_tones: int = NUM_TONES,
+        num_rhymes: int = NUM_RHYMES + 1,
+        use_aux_loss: bool = False,
+        aux_loss_weight: float = 0.1,
+        use_theme: bool = False,
+        num_themes: int = 0,
+        use_lora: bool = False,
+        lora_rank: int = 8,
+        lora_alpha: float = 16.0,
+        lora_dropout: float = 0.0,
     ) -> None:
         super().__init__()
         self.vocab_size = vocab_size
         self.block_size = block_size
         self.d_model = d_model
+        self.use_prosody = bool(use_prosody)
+        self.num_tones = int(num_tones)
+        self.num_rhymes = int(num_rhymes)
+        self.use_aux_loss = bool(use_aux_loss)
+        self.aux_loss_weight = float(aux_loss_weight)
+        self.use_theme = bool(use_theme)
+        self.num_themes = int(num_themes)
+        self.use_lora = False
+        self.lora_rank = int(lora_rank)
+        self.lora_alpha = float(lora_alpha)
+        self.lora_dropout = float(lora_dropout)
         self.tok_emb = nn.Embedding(vocab_size, d_model)
         self.pos_emb = nn.Parameter(torch.zeros(1, block_size, d_model))
+        # ======== Prosody Embeddings: START ========
+        # 变更说明:
+        # - 仅增加 Tone / Rhyme 两类 embedding。
+        # - 不引入韵脚位 embedding，也不在推理阶段做硬约束。
+        if self.use_prosody:
+            self.tone_emb = nn.Embedding(self.num_tones, d_model)
+            self.rhyme_emb = nn.Embedding(self.num_rhymes, d_model)
+        # ======== Prosody Embeddings: END ========
+        # ======== Theme Embedding: START ========
+        # 变更说明:
+        # - 为每首诗注入全局主题 id embedding。
+        # - 相同字在不同主题下可经由该全局条件学习不同语义偏向。
+        if self.use_theme:
+            if self.num_themes <= 0:
+                raise ValueError("启用 theme embedding 时，num_themes 必须 > 0")
+            self.theme_emb = nn.Embedding(self.num_themes, d_model)
+        # ======== Theme Embedding: END ========
         self.drop = nn.Dropout(dropout)
         self.blocks = nn.ModuleList(
             [TransformerBlock(d_model, n_head, block_size, d_ff, dropout) for _ in range(n_layer)]
         )
         self.ln_f = nn.LayerNorm(d_model)
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
+        # ======== Prosody Auxiliary Heads: START ========
+        # 变更说明:
+        # - 训练阶段额外预测下一字的 Tone / Rhyme。
+        # - 用辅助损失推动隐藏表示主动学习格律相关信息。
+        if self.use_aux_loss:
+            self.tone_head = nn.Linear(d_model, self.num_tones)
+            self.rhyme_head = nn.Linear(d_model, self.num_rhymes)
+        # ======== Prosody Auxiliary Heads: END ========
         # 权重共享（常见技巧，可注释掉）
         self.lm_head.weight = self.tok_emb.weight
         self.apply(self._init_weights)
+        if use_lora:
+            self.enable_lora(rank=lora_rank, alpha=lora_alpha, dropout=lora_dropout)
 
     @staticmethod
     def _init_weights(m: nn.Module) -> None:
@@ -140,10 +226,75 @@ class CharGPT(nn.Module):
         if isinstance(m, nn.Linear) and m.bias is not None:
             torch.nn.init.zeros_(m.bias)
 
-    def forward(self, idx: torch.Tensor, targets: Optional[torch.Tensor] = None):
+    # ======== LoRA Support: START ========
+    # 变更说明:
+    # - 允许在保持底座权重不动的前提下，为注意力与 FFN 线性层挂接 LoRA。
+    # - 主题微调阶段只训练 LoRA 与 theme embedding，避免小数据全量更新带来的灾难性遗忘。
+    def _set_named_child(self, parent: nn.Module, child_name: str, child: nn.Module) -> None:
+        if child_name.isdigit():
+            parent[int(child_name)] = child  # type: ignore[index]
+        else:
+            setattr(parent, child_name, child)
+
+    def enable_lora(self, rank: int = 8, alpha: float = 16.0, dropout: float = 0.0) -> None:
+        if self.use_lora:
+            return
+        target_names = []
+        for name, module in self.named_modules():
+            if not isinstance(module, nn.Linear):
+                continue
+            if name in {"lm_head", "tone_head", "rhyme_head"}:
+                continue
+            if ".attn." in name or ".ff.net." in name:
+                target_names.append(name)
+        for name in target_names:
+            parent_name, child_name = name.rsplit(".", 1)
+            parent = self.get_submodule(parent_name)
+            child = self.get_submodule(name)
+            wrapped = LoRALinear(child, rank=rank, alpha=alpha, dropout=dropout)
+            self._set_named_child(parent, child_name, wrapped)
+        self.use_lora = True
+        self.lora_rank = int(rank)
+        self.lora_alpha = float(alpha)
+        self.lora_dropout = float(dropout)
+
+    def freeze_base_for_theme_lora(self) -> None:
+        for name, param in self.named_parameters():
+            param.requires_grad = False
+            if "lora_" in name or "theme_emb" in name:
+                param.requires_grad = True
+    # ======== LoRA Support: END ========
+
+    def forward(
+        self,
+        idx: torch.Tensor,
+        targets: Optional[torch.Tensor] = None,
+        loss_weights: Optional[torch.Tensor] = None,
+        tone_ids: Optional[torch.Tensor] = None,
+        rhyme_ids: Optional[torch.Tensor] = None,
+        tone_targets: Optional[torch.Tensor] = None,
+        rhyme_targets: Optional[torch.Tensor] = None,
+        theme_ids: Optional[torch.Tensor] = None,
+    ):
         b, t = idx.size()
         assert t <= self.block_size, f"长度 {t} 超过 block_size {self.block_size}"
         x = self.tok_emb(idx) + self.pos_emb[:, :t, :]
+        # ======== Prosody Embeddings: START ========
+        # 变更说明:
+        # - 若提供对齐的 tone/rhyme 序列，则与 token embedding 直接相加。
+        # - 生成时也可按当前上下文动态计算后喂入，但不做候选裁剪。
+        if self.use_prosody:
+            if tone_ids is not None:
+                x = x + self.tone_emb(tone_ids)
+            if rhyme_ids is not None:
+                x = x + self.rhyme_emb(rhyme_ids)
+        # ======== Prosody Embeddings: END ========
+        # ======== Theme Embedding: START ========
+        # 变更说明:
+        # - 主题 id 在整首诗范围内广播到每个位置，与 token/pos/prosody embedding 叠加。
+        if self.use_theme and theme_ids is not None:
+            x = x + self.theme_emb(theme_ids)
+        # ======== Theme Embedding: END ========
         x = self.drop(x)
         for blk in self.blocks:
             x = blk(x)
@@ -151,5 +302,28 @@ class CharGPT(nn.Module):
         logits = self.lm_head(x)  # (B, T, V)
         loss = None
         if targets is not None:
-            loss = F.cross_entropy(logits.view(-1, self.vocab_size), targets.view(-1))
+            # ======== Form-Stressed Weighted Loss: START ========
+            # 变更说明:
+            # - 保留原始交叉熵路径，兼容旧训练逻辑。
+            # - 当 train.py 传入逐 token 权重时，改用加权交叉熵，让模型更重视结构标记。
+            flat_logits = logits.view(-1, self.vocab_size)
+            flat_targets = targets.view(-1)
+            per_token_loss = F.cross_entropy(flat_logits, flat_targets, reduction="none")
+            if loss_weights is None:
+                loss = per_token_loss.mean()
+            else:
+                flat_weights = loss_weights.view(-1).to(per_token_loss.dtype)
+                loss = (per_token_loss * flat_weights).sum() / flat_weights.sum().clamp_min(1e-8)
+            # ======== Form-Stressed Weighted Loss: END ========
+            # ======== Prosody Auxiliary Loss: START ========
+            # 变更说明:
+            # - 主损失仍是下一字预测。
+            # - 在此基础上叠加 Tone / Rhyme 辅助交叉熵，不改变推理接口。
+            if self.use_aux_loss and tone_targets is not None and rhyme_targets is not None:
+                tone_logits = self.tone_head(x).view(-1, self.num_tones)
+                rhyme_logits = self.rhyme_head(x).view(-1, self.num_rhymes)
+                tone_loss = F.cross_entropy(tone_logits, tone_targets.view(-1))
+                rhyme_loss = F.cross_entropy(rhyme_logits, rhyme_targets.view(-1))
+                loss = loss + self.aux_loss_weight * (tone_loss + rhyme_loss)
+            # ======== Prosody Auxiliary Loss: END ========
         return logits, loss

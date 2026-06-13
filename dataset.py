@@ -38,6 +38,10 @@ class PoetryBlockDataset(Dataset):
         block_size: int,
         num_samples: Optional[int] = None,
         sample_random: bool = True,
+        target_token_weights: Optional[Dict[int, float]] = None,
+        tone_path: Optional[str] = None,
+        rhyme_path: Optional[str] = None,
+        theme_path: Optional[str] = None,
     ) -> None:
         if not os.path.isfile(data_path):
             raise FileNotFoundError(data_path)
@@ -59,15 +63,85 @@ class PoetryBlockDataset(Dataset):
             and (num_samples is not None and int(num_samples) > 0)
             and (self._len < self._max_i)
         )
+        # ======== Form Weighting Dataset Hook: START ========
+        # 变更说明:
+        # - 允许按目标 token 生成逐位置 loss 权重。
+        # - 这样 train.py 可以直接对行分隔符/阕分隔符/结束符施加更高监督强度。
+        self.target_token_weights = {
+            int(token_id): float(weight)
+            for token_id, weight in (target_token_weights or {}).items()
+            if float(weight) != 1.0
+        }
+        self.return_loss_weights = bool(self.target_token_weights)
+        # ======== Form Weighting Dataset Hook: END ========
+        # ======== Prosody Dataset Hook: START ========
+        # 变更说明:
+        # - 可选加载与 token 严格对齐的 tone/rhyme 长序列。
+        # - __getitem__ 返回与 x/y 同窗口对齐的输入标签与目标标签。
+        self.tone = None
+        self.rhyme = None
+        if tone_path:
+            if not os.path.isfile(tone_path):
+                raise FileNotFoundError(tone_path)
+            self.tone = torch.load(tone_path, map_location="cpu")
+            if self.tone.shape != self.data.shape:
+                raise ValueError("tone 张量长度与 token 数据不一致")
+        if rhyme_path:
+            if not os.path.isfile(rhyme_path):
+                raise FileNotFoundError(rhyme_path)
+            self.rhyme = torch.load(rhyme_path, map_location="cpu")
+            if self.rhyme.shape != self.data.shape:
+                raise ValueError("rhyme 张量长度与 token 数据不一致")
+        self.return_prosody = self.tone is not None and self.rhyme is not None
+        self.theme = None
+        if theme_path:
+            if not os.path.isfile(theme_path):
+                raise FileNotFoundError(theme_path)
+            self.theme = torch.load(theme_path, map_location="cpu")
+            if self.theme.shape != self.data.shape:
+                raise ValueError("theme 张量长度与 token 数据不一致")
+        self.return_theme = self.theme is not None
+        # ======== Prosody Dataset Hook: END ========
 
     def __len__(self) -> int:
         return int(self._len)
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, ...]:
         if self._sample_random:
             i = random.randrange(0, self._max_i)
         else:
             i = int(idx) % int(self._max_i)
         x = self.data[i : i + self.block_size].clone()
         y = self.data[i + 1 : i + 1 + self.block_size].clone()
+        tone_x = tone_y = rhyme_x = rhyme_y = None
+        theme_x = None
+        if self.return_prosody:
+            tone_x = self.tone[i : i + self.block_size].clone()
+            tone_y = self.tone[i + 1 : i + 1 + self.block_size].clone()
+            rhyme_x = self.rhyme[i : i + self.block_size].clone()
+            rhyme_y = self.rhyme[i + 1 : i + 1 + self.block_size].clone()
+        if self.return_theme:
+            theme_x = self.theme[i : i + self.block_size].clone()
+        # ======== Form Weighting Dataset Hook: START ========
+        # 变更说明:
+        # - 对应目标位置默认权重为 1。
+        # - 若该位置目标 token 是结构标记，则提升其 loss 权重。
+        if self.return_loss_weights:
+            weights = torch.ones_like(y, dtype=torch.float32)
+            for token_id, weight in self.target_token_weights.items():
+                weights[y == token_id] = float(weight)
+            if self.return_prosody and self.return_theme:
+                return x, y, weights, tone_x, tone_y, rhyme_x, rhyme_y, theme_x
+            if self.return_prosody:
+                return x, y, weights, tone_x, tone_y, rhyme_x, rhyme_y
+            if self.return_theme:
+                return x, y, weights, theme_x
+            return x, y, weights
+        # ======== Form Weighting Dataset Hook: END ========
+        if self.return_prosody and self.return_theme:
+            return x, y, tone_x, tone_y, rhyme_x, rhyme_y, theme_x
+        if self.return_prosody:
+            return x, y, tone_x, tone_y, rhyme_x, rhyme_y
+        if self.return_theme:
+            return x, y, theme_x
         return x, y

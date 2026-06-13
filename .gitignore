@@ -1,0 +1,36 @@
+# macOS / Python cache
+.DS_Store
+__pycache__/
+*.pyc
+
+# Local reference / experiment folders
+06/
+BERT_CCPoem_v1/
+Datasets/
+New Data/
+Reference/
+processed_poetry_full/
+
+# Model checkpoints / plots
+*.pt
+*_loss*.png
+structured_loss*.png
+theme_lora_loss*.png
+
+# Generated datasets and vocab/stats
+poetry.txt
+vocab.json
+train_data.pt
+val_data.pt
+structured_*.txt
+structured_*.json
+structured_*.pt
+theme_*.txt
+theme_*.json
+theme_*.pt
+new_data_2179_prefixed.txt
+
+# Other generated artifacts
+bert_poem_sentiment_best.pt
+bert_poem_sentiment_metrics.json
+*.log

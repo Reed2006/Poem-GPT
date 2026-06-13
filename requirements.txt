@@ -5,3 +5,6 @@ huggingface_hub>=0.16.0
 
 # 训练与作图（train.py）
 matplotlib>=3.5.0
+
+# 韵律标注（prosody.py）
+pypinyin>=0.54.0
